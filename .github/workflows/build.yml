@@ -1,18 +1,12 @@
 # ---------------------------------------------------------------------------
 # WinCache CI — Build kernel driver (cacheflt.sys) and management tool
-#
-# Triggered on push/PR to main, or manually via the "Actions" tab.
-# Downloads compiled artifacts from the summary page after the build finishes.
 # ---------------------------------------------------------------------------
-
 name: Build WinCache
 
 on:
   push:
     branches: [main, master]
-  pull_request:
-    branches: [main, master]
-  workflow_dispatch:   # allow manual trigger from Actions tab
+  workflow_dispatch:
 
 jobs:
   build:
@@ -20,149 +14,116 @@ jobs:
     runs-on: windows-2022
 
     steps:
-      # ------------------------------------------------------------------
-      # Step 2: Checkout source code
-      # ------------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
       # ------------------------------------------------------------------
-      # Step 3: Set up the build environment (VS + SDK paths)
-      #
-      # We use cl.exe/link.exe directly — no MSBuild, no WDK installer needed.
-      # The windows-2022 runner image already has:
-      #   - Visual Studio 2022 with C++ tools
-      #   - Windows SDK with WDK headers (km/, wdf/) and libs
-      # We just need to set INCLUDE, LIB, and PATH correctly.
+      # Install WDK — tried 3 ways, in order of reliability:
+      #   1. VS installer (add WDK workload to existing VS)
+      #   2. winget
+      #   3. Direct MSI download
       # ------------------------------------------------------------------
-      - name: Set up build environment
+      - name: Install WDK
         shell: pwsh
         run: |
-          # Locate VS and SDK versions
-          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
-            -latest -property installationPath
-          $vcTools = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory `
-            | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Name
-          $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
-          $sdkVer  = Get-ChildItem "$sdkRoot\Include" -Directory `
-            | Where-Object { $_.Name -match '^10\.0\.\d+\.\d+$' } `
-            | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Name
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $wdkCheck = Join-Path $vsPath "MSBuild\Microsoft\VC\v170\Microsoft.DriverKit.Defaults.props"
 
-          Write-Host "VS:       $vsPath"
-          Write-Host "VC Tools: $vcTools"
-          Write-Host "SDK:      $sdkVer"
+          if (Test-Path $wdkCheck) {
+            Write-Host "::notice::WDK already installed"
+            exit 0
+          }
 
-          $vcBin    = "$vsPath\VC\Tools\MSVC\$vcTools\bin\Hostx64\x64"
-          $sdkBin   = "$sdkRoot\bin\$sdkVer\x64"
-          $incKm    = "$sdkRoot\Include\$sdkVer\km"
-          $incShared= "$sdkRoot\Include\$sdkVer\shared"
-          $incUcrt  = "$sdkRoot\Include\$sdkVer\ucrt"
-          $incWdf   = "$sdkRoot\Include\wdf\kmdf\1.33"
-          $incVc    = "$vsPath\VC\Tools\MSVC\$vcTools\include"
-          $libKm    = "$sdkRoot\Lib\$sdkVer\km\x64"
-          $libUcrt  = "$sdkRoot\Lib\$sdkVer\ucrt\x64"
-          $libVc    = "$vsPath\VC\Tools\MSVC\$vcTools\lib\x64"
+          # Method 1: VS installer
+          Write-Host "Installing WDK via VS installer..."
+          $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          $proc = Start-Process -FilePath $vsInstaller -ArgumentList @(
+            "modify",
+            "--installPath", $vsPath,
+            "--add", "Microsoft.VisualStudio.Component.Windows11WDK.24H2",
+            "--quiet",
+            "--norestart"
+          ) -Wait -PassThru -NoNewWindow
 
-          # Export as environment variables for later steps
-          "VCBIN=$vcBin"         | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SDKBIN=$sdkBin"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "INC_KM=$incKm"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "INC_SHARED=$incShared"| Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "INC_UCRT=$incUcrt"    | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "INC_WDF=$incWdf"      | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "INC_VC=$incVc"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "LIB_KM=$libKm"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "LIB_UCRT=$libUcrt"    | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "LIB_VC=$libVc"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "SDK_VER=$sdkVer"      | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "VS_PATH=$vsPath"      | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "VS installer exit code: $($proc.ExitCode)"
 
-          Write-Host "Build environment configured."
-          Write-Host "WDF headers at: $incWdf"
+          if (Test-Path $wdkCheck) {
+            Write-Host "::notice::WDK installed via VS installer"
+            exit 0
+          }
+
+          # Method 2: try the non-versioned component ID
+          Write-Host "Trying alternative component ID..."
+          $proc = Start-Process -FilePath $vsInstaller -ArgumentList @(
+            "modify",
+            "--installPath", $vsPath,
+            "--add", "Microsoft.VisualStudio.Component.Windows11WDK",
+            "--quiet",
+            "--norestart"
+          ) -Wait -PassThru -NoNewWindow
+
+          if (Test-Path $wdkCheck) {
+            Write-Host "::notice::WDK installed via VS installer (alt ID)"
+            exit 0
+          }
+
+          # Method 3: winget
+          Write-Host "Trying winget..."
+          winget install --id Microsoft.WindowsWDK --exact --silent --accept-source-agreements --accept-package-agreements
+          if ($LASTEXITCODE -eq 0 -and (Test-Path $wdkCheck)) {
+            Write-Host "::notice::WDK installed via winget"
+            exit 0
+          }
+
+          # Method 4: Direct download
+          Write-Host "Trying direct MSI download..."
+          $url = "https://go.microsoft.com/fwlink/?linkid=2291857"
+          $out = "$env:TEMP\wdksetup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -MaximumRedirection 10
+          $size = (Get-Item $out).Length
+          Write-Host "Downloaded $size bytes"
+          if ($size -lt 5000000) {
+            Write-Host "::error::WDK download too small ($size bytes), probably redirect failed"
+            exit 1
+          }
+          Start-Process -FilePath $out -ArgumentList "/quiet","/norestart" -Wait -NoNewWindow
+
+          if (-not (Test-Path $wdkCheck)) {
+            Write-Host "::error::All WDK install methods failed"
+            Get-ChildItem "$vsPath\MSBuild\Microsoft\VC\v170" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" }
+            exit 1
+          }
+          Write-Host "::notice::WDK installed via MSI"
 
       # ------------------------------------------------------------------
-      # Step 4: Build the kernel driver (cacheflt.sys) with cl.exe directly
+      # Build using MSBuild (now that WDK is installed)
       # ------------------------------------------------------------------
-      - name: Build driver (cacheflt.sys)
-        shell: cmd
+      - name: Build
         run: |
-          set "PATH=%VCBIN%;%SDKBIN%;%PATH%"
-          set "INCLUDE=%INC_VC%;%INC_KM%;%INC_SHARED%;%INC_UCRT%;%INC_WDF%"
-          set "LIB=%LIB_KM%;%LIB_UCRT%;%LIB_VC%"
-          cl /nologo /O2 /Gs- /kernel /I shared ^
-            /D_KERNEL_MODE /DNDEBUG /D_AMD64_ /D_WIN64 /D_M_AMD64 ^
-            /DNTDDI_VERSION=0x0A00000C /D_WIN32_WINNT=0x0A00 ^
-            /c driver\*.c
-          if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
-          link /nologo /driver /subsystem:native ^
-            ntoskrnl.lib wdfldr.lib wdmsec.lib ^
-            /out:cacheflt.sys ^
-            *.obj
-          if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
-          echo cacheflt.sys built successfully.
+          msbuild WinCache.sln /p:Configuration=Release /p:Platform=x64 /m /v:minimal
 
       # ------------------------------------------------------------------
-      # Step 5: Build the management tool (cachectl.exe)
-      #
-      # User-mode app — much simpler than the driver. Uses env vars from step 3.
+      # Verify
       # ------------------------------------------------------------------
-      - name: Build manager (cachectl.exe)
-        shell: cmd
-        run: |
-          set PATH=%VCBIN%;%SDKBIN%;%PATH%
-          cl /nologo /O2 /I shared /DUNICODE /D_UNICODE ^
-            /Fe:cachectl.exe ^
-            manager\main.c ^
-            /link kernel32.lib advapi32.lib user32.lib
-          if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
-          echo cachectl.exe built successfully.
-
-      # ------------------------------------------------------------------
-      # Step 6: Verify build outputs
-      # ------------------------------------------------------------------
-      - name: Verify build outputs
+      - name: Verify
         shell: pwsh
         run: |
-          Write-Host "Checking build outputs..."
           $sys = Get-ChildItem -Recurse -Filter "cacheflt.sys" | Select -First 1
           $exe = Get-ChildItem -Recurse -Filter "cachectl.exe" | Select -First 1
-
-          if (-not $sys) { Write-Error "cacheflt.sys not found!"; exit 1 }
-          if (-not $exe) { Write-Error "cachectl.exe not found!"; exit 1 }
-
-          Write-Host ""
-          Write-Host "================================================"
-          Write-Host " BUILD SUCCESSFUL"
-          Write-Host "================================================"
-          Write-Host "  cacheflt.sys : $($sys.FullName) ($('{0:N0}' -f $sys.Length) bytes)"
-          Write-Host "  cachectl.exe : $($exe.FullName) ($('{0:N0}' -f $exe.Length) bytes)"
-          Write-Host "================================================"
+          if (-not $sys) { Write-Error "cacheflt.sys not found"; exit 1 }
+          if (-not $exe) { Write-Error "cachectl.exe not found"; exit 1 }
+          Write-Host "SUCCESS: cacheflt.sys ($('{0:N0}' -f $sys.Length) bytes)"
+          Write-Host "SUCCESS: cachectl.exe ($('{0:N0}' -f $exe.Length) bytes)"
 
       # ------------------------------------------------------------------
-      # Step 7: Upload artifacts (available from Actions summary page)
-      #
-      # GitHub retains artifacts for 90 days by default.
-      # Download from: Actions → <this run> → Artifacts section
+      # Upload
       # ------------------------------------------------------------------
-      - name: Upload cacheflt.sys
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: cacheflt-driver
+          name: wincache-build
           path: |
             **/cacheflt.sys
-            driver/cacheflt.inf
-
-      - name: Upload cachectl.exe
-        uses: actions/upload-artifact@v4
-        with:
-          name: cachectl-manager
-          path: |
             **/cachectl.exe
-
-      - name: Upload installer scripts
-        uses: actions/upload-artifact@v4
-        with:
-          name: installer
-          path: |
-            installer/install.bat
-            installer/uninstall.bat
+            driver/cacheflt.inf
+            installer/*.bat
