@@ -35,47 +35,68 @@ jobs:
       # ------------------------------------------------------------------
       # Step 3: Install the Windows Driver Kit (WDK)
       #
-      # We install the standalone WDK for Windows 11. The installer is a
-      # self-extracting EXE that supports /quiet mode.
+      # The WDK is required to build kernel drivers with the
+      # "WindowsKernelModeDriver10.0" MSBuild platform toolset.
       #
-      # If this step ever fails because Microsoft changed the link, update
-      # the URL below. Find the latest at:
-      #   https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk
+      # Strategy (tried in order):
+      #   1. Check if already installed on the runner
+      #   2. Chocolatey (most reliable for automated installs)
+      #   3. Direct MSI download with PE validation
       # ------------------------------------------------------------------
       - name: Install WDK
         shell: pwsh
         run: |
-          Write-Host "Downloading Windows 11 WDK..."
+          $ErrorActionPreference = "Stop"
+
+          # Check if WDK is already installed
+          $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          if (Test-Path "$wdkRoot\Include\10.0.*\km\wdm.h") {
+            Write-Host "WDK already installed at $wdkRoot"
+            Get-ChildItem "$wdkRoot\Include" -Directory | ForEach-Object { Write-Host "  SDK/WDK version: $($_.Name)" }
+            exit 0
+          }
+
+          # Try chocolatey — the most reliable method for CI
+          Write-Host "Installing WDK via Chocolatey..."
+          choco install windowsdriverkit -y --no-progress --limit-output --timeout 600
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "WDK installed successfully via Chocolatey."
+            exit 0
+          }
+          Write-Host "Chocolatey failed (exit code $LASTEXITCODE), trying direct download..."
+
+          # Fallback: direct download from Microsoft
           $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2291857"
           $wdkExe = "$env:TEMP\wdksetup.exe"
 
-          # Download with retry
-          $maxRetries = 3
-          for ($i = 0; $i -lt $maxRetries; $i++) {
-            try {
-              Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkExe -ErrorAction Stop
-              break
-            } catch {
-              if ($i -eq $maxRetries - 1) { throw }
-              Write-Host "Download failed, retrying ($($i+1)/$maxRetries)..."
-              Start-Sleep -Seconds 5
-            }
+          Write-Host "Downloading from $wdkUrl ..."
+          Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkExe -UseBasicParsing `
+            -MaximumRedirection 10 -TimeoutSec 300
+
+          # Validate the download — must start with MZ (PE executable)
+          $bytes = [System.IO.File]::ReadAllBytes($wdkExe)
+          $size = $bytes.Length
+          Write-Host "Downloaded $size bytes"
+          if ($size -lt 1000000) {
+            Write-Error "Downloaded file is too small ($size bytes) — likely a redirect/error page, not the WDK installer"
+            Write-Host "First 500 bytes (hex): $([BitConverter]::ToString($bytes[0..499]))"
+            exit 1
+          }
+          # Check MZ signature
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            Write-Error "Downloaded file is not a PE executable — bad magic bytes"
+            exit 1
           }
 
-          Write-Host "Installing WDK (this takes ~5 minutes)..."
+          Write-Host "Running WDK installer..."
           $proc = Start-Process -FilePath $wdkExe `
-            -ArgumentList "/quiet", "/norestart", "/log", "$env:TEMP\wdk_install.log" `
-            -Wait -PassThru
-
+            -ArgumentList "/quiet","/norestart" `
+            -Wait -PassThru -NoNewWindow
           if ($proc.ExitCode -ne 0) {
-            Write-Host "WDK installer exited with code $($proc.ExitCode)"
-            Write-Host "--- Install log (last 30 lines) ---"
-            Get-Content "$env:TEMP\wdk_install.log" -Tail 30
-            Write-Host "Falling back to chocolatey..."
-            choco install windowsdriverkit -y --no-progress
+            Write-Error "WDK installer failed with exit code $($proc.ExitCode)"
+            exit 1
           }
-
-          Write-Host "WDK installation complete."
+          Write-Host "WDK installed successfully via direct download."
 
       # ------------------------------------------------------------------
       # Step 4: Build the complete solution
