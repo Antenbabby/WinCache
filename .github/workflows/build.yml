@@ -21,107 +21,100 @@ jobs:
 
     steps:
       # ------------------------------------------------------------------
-      # Step 1: Checkout source code
+      # Step 2: Checkout source code
       # ------------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
       # ------------------------------------------------------------------
-      # Step 2: Setup MSBuild (already on the runner, but this ensures PATH)
-      # ------------------------------------------------------------------
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
-
-      # ------------------------------------------------------------------
-      # Step 3: Install the Windows Driver Kit (WDK)
+      # Step 3: Set up the build environment (VS + SDK paths)
       #
-      # The WDK is required for the "WindowsKernelModeDriver10.0" MSBuild
-      # platform toolset. Without it, MSBuild cannot compile kernel drivers.
-      #
-      # NOTE: The runner may have SDK headers (e.g. wdm.h) but NOT the WDK
-      # MSBuild toolset. We must install the full WDK regardless.
+      # We use cl.exe/link.exe directly — no MSBuild, no WDK installer needed.
+      # The windows-2022 runner image already has:
+      #   - Visual Studio 2022 with C++ tools
+      #   - Windows SDK with WDK headers (km/, wdf/) and libs
+      # We just need to set INCLUDE, LIB, and PATH correctly.
       # ------------------------------------------------------------------
-      - name: Install WDK
+      - name: Set up build environment
         shell: pwsh
         run: |
-          # Check if the WDK MSBuild toolset exists (not just headers)
+          # Locate VS and SDK versions
           $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
             -latest -property installationPath
-          $wdkTargets = Join-Path $vsPath "MSBuild\Microsoft\VC\v170\Microsoft.DriverKit.Defaults.props"
-          if (Test-Path $wdkTargets) {
-            Write-Host "WDK MSBuild toolset already installed at $wdkTargets"
-            exit 0
-          }
-          Write-Host "WDK MSBuild toolset NOT found (checked: $wdkTargets)"
-          Write-Host "Headers existing is NOT enough — must install full WDK."
+          $vcTools = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory `
+            | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Name
+          $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $sdkVer  = Get-ChildItem "$sdkRoot\Include" -Directory `
+            | Where-Object { $_.Name -match '^10\.0\.\d+\.\d+$' } `
+            | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Name
 
-          # Install WDK via Chocolatey
-          Write-Host "Installing WDK via Chocolatey (this takes a few minutes)..."
-          choco install windowsdriverkit -y --no-progress --limit-output --timeout 900
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Chocolatey WDK install failed with exit code $LASTEXITCODE"
-            exit 1
-          }
-          Write-Host "WDK installed successfully."
+          Write-Host "VS:       $vsPath"
+          Write-Host "VC Tools: $vcTools"
+          Write-Host "SDK:      $sdkVer"
+
+          $vcBin    = "$vsPath\VC\Tools\MSVC\$vcTools\bin\Hostx64\x64"
+          $sdkBin   = "$sdkRoot\bin\$sdkVer\x64"
+          $incKm    = "$sdkRoot\Include\$sdkVer\km"
+          $incShared= "$sdkRoot\Include\$sdkVer\shared"
+          $incUcrt  = "$sdkRoot\Include\$sdkVer\ucrt"
+          $incWdf   = "$sdkRoot\Include\wdf\kmdf\1.33"
+          $incVc    = "$vsPath\VC\Tools\MSVC\$vcTools\include"
+          $libKm    = "$sdkRoot\Lib\$sdkVer\km\x64"
+          $libUcrt  = "$sdkRoot\Lib\$sdkVer\ucrt\x64"
+          $libVc    = "$vsPath\VC\Tools\MSVC\$vcTools\lib\x64"
+
+          # Export as environment variables for later steps
+          "VCBIN=$vcBin"         | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SDKBIN=$sdkBin"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "INC_KM=$incKm"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "INC_SHARED=$incShared"| Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "INC_UCRT=$incUcrt"    | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "INC_WDF=$incWdf"      | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "INC_VC=$incVc"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LIB_KM=$libKm"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LIB_UCRT=$libUcrt"    | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LIB_VC=$libVc"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SDK_VER=$sdkVer"      | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VS_PATH=$vsPath"      | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "Build environment configured."
+          Write-Host "WDF headers at: $incWdf"
 
       # ------------------------------------------------------------------
-      # Step 4: Build the kernel driver (cacheflt.sys)
+      # Step 4: Build the kernel driver (cacheflt.sys) with cl.exe directly
       # ------------------------------------------------------------------
       - name: Build driver (cacheflt.sys)
+        shell: cmd
         run: |
-          msbuild driver\cacheflt.vcxproj `
-            /p:Configuration=Release `
-            /p:Platform=x64 `
-            /m `
-            /v:minimal
+          set "PATH=%VCBIN%;%SDKBIN%;%PATH%"
+          set "INCLUDE=%INC_VC%;%INC_KM%;%INC_SHARED%;%INC_UCRT%;%INC_WDF%"
+          set "LIB=%LIB_KM%;%LIB_UCRT%;%LIB_VC%"
+          cl /nologo /O2 /Gs- /kernel /I shared ^
+            /D_KERNEL_MODE /DNDEBUG ^
+            /c driver\*.c
+          if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
+          link /nologo /driver /subsystem:native ^
+            ntoskrnl.lib wdfldr.lib wdmsec.lib ^
+            /out:cacheflt.sys ^
+            *.obj
+          if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
+          echo cacheflt.sys built successfully.
 
       # ------------------------------------------------------------------
       # Step 5: Build the management tool (cachectl.exe)
       #
-      # We use cl.exe directly to avoid MSBuild toolset version issues.
-      # The VS install path and VC tools are located via vswhere.
+      # User-mode app — much simpler than the driver. Uses env vars from step 3.
       # ------------------------------------------------------------------
       - name: Build manager (cachectl.exe)
-        shell: pwsh
+        shell: cmd
         run: |
-          # Find Visual Studio
-          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
-            -latest -property installationPath
-          Write-Host "Visual Studio: $vsPath"
-
-          # Find the VC tools version
-          $vcToolsVersion = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory `
-            | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Name
-          Write-Host "VC Tools version: $vcToolsVersion"
-
-          # Set up PATH for cl.exe and friends
-          $vcBin = "$vsPath\VC\Tools\MSVC\$vcToolsVersion\bin\Hostx64\x64"
-
-          # Find the latest Windows SDK version
-          $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
-          $sdkVer = Get-ChildItem "$sdkRoot\Include" -Directory `
-            | Where-Object { $_.Name -match '^10\.0\.\d+\.\d+$' } `
-            | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Name
-          Write-Host "Windows SDK version: $sdkVer"
-
-          $sdkBin = "$sdkRoot\bin\$sdkVer\x64"
-          $sdkInclude = "$sdkRoot\Include\$sdkVer"
-          $sdkLib = "$sdkRoot\Lib\$sdkVer"
-          $ucrtInclude = "$sdkInclude\ucrt"
-          $ucrtLib = "$sdkLib\ucrt\x64"
-
-          $vcBase = "$vsPath\VC\Tools\MSVC\$vcToolsVersion"
-          $env:PATH = "$vcBin;$sdkBin;$env:PATH"
-          $env:INCLUDE = "$vcBase\include;$sdkInclude;$ucrtInclude"
-          $env:LIB = "$vcBase\lib\x64;$sdkLib;$ucrtLib"
-
-          Write-Host "Compiler: $(Get-Command cl.exe | Select -ExpandProperty Source)"
-
-          # Build
-          New-Item -ItemType Directory -Force -Path bin\x64\Release | Out-Null
-          cl /nologo /O2 /I shared /DUNICODE /D_UNICODE /Fe:bin\x64\Release\cachectl.exe manager\main.c /link kernel32.lib advapi32.lib user32.lib
-          if ($LASTEXITCODE -ne 0) { Write-Error "cl.exe failed"; exit 1 }
-          Write-Host "cachectl.exe built successfully."
+          set PATH=%VCBIN%;%SDKBIN%;%PATH%
+          cl /nologo /O2 /I shared /DUNICODE /D_UNICODE ^
+            /Fe:cachectl.exe ^
+            manager\main.c ^
+            /link kernel32.lib advapi32.lib user32.lib
+          if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
+          echo cachectl.exe built successfully.
 
       # ------------------------------------------------------------------
       # Step 6: Verify build outputs
