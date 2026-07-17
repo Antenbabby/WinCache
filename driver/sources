@@ -1,0 +1,41 @@
+#
+# sources — WDK build configuration for cacheflt.sys
+#
+# Standard WDK "sources" file pattern. Used by nmake/build.
+#
+
+TARGETNAME=cacheflt
+TARGETTYPE=DRIVER
+
+# Use KMDF (Kernel-Mode Driver Framework) v1.33+
+KMDF_VERSION_MAJOR=1
+
+# Source files
+SOURCES= \
+    cacheflt.c   \
+    io.c         \
+    ioctl.c      \
+    cache.c      \
+    attach.c     \
+    superblock.c \
+    index.c      \
+    lru.c        \
+    stats.c
+
+# Include directories
+INCLUDES=..\shared
+
+# Target OS (Windows 10+)
+TARGETOSVERSION=Win10
+
+# Build for x64 (release)
+TARGETLIBS= \
+    $(DDK_LIB_PATH)\ntoskrnl.lib \
+    $(DDK_LIB_PATH)\wdfldr.lib    \
+    $(DDK_LIB_PATH)\wdmsec.lib
+
+# Compiler flags
+C_DEFINES=$(C_DEFINES) -D_KERNEL_MODE
+
+# Optimization
+MSC_OPTIMIZATION=/O2 /Oi

@@ -1,0 +1,38 @@
+# WinCache .gitignore
+
+# Build outputs
+bin/
+obj/
+*.sys
+*.exe
+*.pdb
+*.cat
+*.cer
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.log
+*.tlog
+
+# WDK build
+BuildLogs/
+*.wrn
+*.err
+buildchk_*
+buildfre_*
+
+# IDE / Editor
+.idea/
+*.swp
+*.swo
+*~
+.vscode/
+.DS_Store
+Thumbs.db
+
+# EWDK temp
+ewdk.iso

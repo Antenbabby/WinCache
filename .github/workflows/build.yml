@@ -1,0 +1,146 @@
+# ---------------------------------------------------------------------------
+# WinCache CI — Build kernel driver (cacheflt.sys) and management tool
+#
+# Triggered on push/PR to main, or manually via the "Actions" tab.
+# Downloads compiled artifacts from the summary page after the build finishes.
+# ---------------------------------------------------------------------------
+
+name: Build WinCache
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:   # allow manual trigger from Actions tab
+
+jobs:
+  build:
+    name: Build (x64 Release)
+    runs-on: windows-2022
+
+    steps:
+      # ------------------------------------------------------------------
+      # Step 1: Checkout source code
+      # ------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # Step 2: Setup MSBuild (already on the runner, but this ensures PATH)
+      # ------------------------------------------------------------------
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # ------------------------------------------------------------------
+      # Step 3: Install the Windows Driver Kit (WDK)
+      #
+      # We install the standalone WDK for Windows 11. The installer is a
+      # self-extracting EXE that supports /quiet mode.
+      #
+      # If this step ever fails because Microsoft changed the link, update
+      # the URL below. Find the latest at:
+      #   https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk
+      # ------------------------------------------------------------------
+      - name: Install WDK
+        shell: pwsh
+        run: |
+          Write-Host "Downloading Windows 11 WDK..."
+          $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2291857"
+          $wdkExe = "$env:TEMP\wdksetup.exe"
+
+          # Download with retry
+          $maxRetries = 3
+          for ($i = 0; $i -lt $maxRetries; $i++) {
+            try {
+              Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkExe -ErrorAction Stop
+              break
+            } catch {
+              if ($i -eq $maxRetries - 1) { throw }
+              Write-Host "Download failed, retrying ($($i+1)/$maxRetries)..."
+              Start-Sleep -Seconds 5
+            }
+          }
+
+          Write-Host "Installing WDK (this takes ~5 minutes)..."
+          $proc = Start-Process -FilePath $wdkExe `
+            -ArgumentList "/quiet", "/norestart", "/log", "$env:TEMP\wdk_install.log" `
+            -Wait -PassThru
+
+          if ($proc.ExitCode -ne 0) {
+            Write-Host "WDK installer exited with code $($proc.ExitCode)"
+            Write-Host "--- Install log (last 30 lines) ---"
+            Get-Content "$env:TEMP\wdk_install.log" -Tail 30
+            Write-Host "Falling back to chocolatey..."
+            choco install windowsdriverkit -y --no-progress
+          }
+
+          Write-Host "WDK installation complete."
+
+      # ------------------------------------------------------------------
+      # Step 4: Build the complete solution
+      #
+      # WinCache.sln builds both:
+      #   - cacheflt.sys  (kernel driver)
+      #   - cachectl.exe  (management tool)
+      # ------------------------------------------------------------------
+      - name: Build solution
+        run: |
+          msbuild WinCache.sln `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:WindowsTargetPlatformVersion=10.0 `
+            /m `
+            /v:minimal
+
+      # ------------------------------------------------------------------
+      # Step 5: Verify outputs exist
+      # ------------------------------------------------------------------
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          Write-Host "Checking build outputs..."
+          $sys = Get-ChildItem -Recurse -Filter "cacheflt.sys" | Select -First 1
+          $exe = Get-ChildItem -Recurse -Filter "cachectl.exe" | Select -First 1
+
+          if (-not $sys) { Write-Error "cacheflt.sys not found!"; exit 1 }
+          if (-not $exe) { Write-Error "cachectl.exe not found!"; exit 1 }
+
+          Write-Host ""
+          Write-Host "================================================"
+          Write-Host " BUILD SUCCESSFUL"
+          Write-Host "================================================"
+          Write-Host "  cacheflt.sys : $($sys.FullName) ($('{0:N0}' -f $sys.Length) bytes)"
+          Write-Host "  cachectl.exe : $($exe.FullName) ($('{0:N0}' -f $exe.Length) bytes)"
+          Write-Host "================================================"
+
+      # ------------------------------------------------------------------
+      # Step 6: Upload artifacts (available from Actions summary page)
+      #
+      # GitHub retains artifacts for 90 days by default.
+      # Download from: Actions → <this run> → Artifacts section
+      # ------------------------------------------------------------------
+      - name: Upload cacheflt.sys
+        uses: actions/upload-artifact@v4
+        with:
+          name: cacheflt-driver
+          path: |
+            **/cacheflt.sys
+            **/cacheflt.pdb
+            driver/cacheflt.inf
+
+      - name: Upload cachectl.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: cachectl-manager
+          path: |
+            **/cachectl.exe
+            **/cachectl.pdb
+
+      - name: Upload installer scripts
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: |
+            installer/install.bat
+            installer/uninstall.bat

@@ -1,0 +1,71 @@
+;
+; cacheflt.inf — Installation file for the Cache Filter Driver
+;
+; Registers cacheflt.sys as a lower filter for the Disk class ({4D36E967...}).
+; This causes the PnP manager to load us below Disk.sys for every disk.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = DiskDrive
+ClassGUID   = {4D36E967-E325-11CE-BFC1-08002BE10318}
+Provider    = %ManufacturerName%
+CatalogFile = cacheflt.cat
+DriverVer   = 07/18/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12  ; %SystemRoot%\system32\drivers
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+cacheflt.sys = 1
+
+;-------------------------------------------------------------------------------
+; Manufacturer section
+;-------------------------------------------------------------------------------
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%CacheFlt.DeviceDesc% = CacheFlt_Install,,CacheFlt
+
+;-------------------------------------------------------------------------------
+; Driver installation — register as lower class filter for Disk class
+;-------------------------------------------------------------------------------
+[CacheFlt_Install]
+CopyFiles = CacheFlt_CopyFiles
+
+[CacheFlt_Install.Services]
+AddService = cacheflt,,CacheFlt_Service
+
+[CacheFlt_Service]
+DisplayName    = %CacheFlt.ServiceDesc%
+ServiceType    = 2           ; SERVICE_FILE_SYSTEM_DRIVER
+StartType      = 0           ; SERVICE_BOOT_START (load early)
+ErrorControl   = 1           ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\cacheflt.sys
+LoadOrderGroup = PNP Filter
+
+[CacheFlt_CopyFiles]
+cacheflt.sys
+
+;-------------------------------------------------------------------------------
+; LowerFilters registry entry
+; Ensures cacheflt loads below the function driver (Disk.sys)
+;-------------------------------------------------------------------------------
+[CacheFlt_Install.HW]
+AddReg = CacheFlt_LowerFilters
+
+[CacheFlt_LowerFilters]
+HKR,,"LowerFilters",0x00010000,"cacheflt"
+
+;-------------------------------------------------------------------------------
+; Strings
+;-------------------------------------------------------------------------------
+[Strings]
+ManufacturerName         = "WinCache"
+DiskName                 = "Cache Filter Driver Installation Disk"
+CacheFlt.DeviceDesc      = "WinCache Read-Acceleration Filter"
+CacheFlt.ServiceDesc     = "WinCache Filter Driver"
