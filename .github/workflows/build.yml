@@ -90,7 +90,7 @@ jobs:
           set "INCLUDE=%INC_VC%;%INC_KM%;%INC_SHARED%;%INC_UCRT%;%INC_WDF%"
           set "LIB=%LIB_KM%;%LIB_UCRT%;%LIB_VC%"
           cl /nologo /O2 /Gs- /kernel /I shared ^
-            /D_KERNEL_MODE /DNDEBUG ^
+            /D_KERNEL_MODE /DNDEBUG /D_AMD64_ /DWIN32=100 ^
             /c driver\*.c
           if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
           link /nologo /driver /subsystem:native ^
