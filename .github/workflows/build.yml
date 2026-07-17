@@ -35,87 +35,96 @@ jobs:
       # ------------------------------------------------------------------
       # Step 3: Install the Windows Driver Kit (WDK)
       #
-      # The WDK is required to build kernel drivers with the
-      # "WindowsKernelModeDriver10.0" MSBuild platform toolset.
+      # The WDK is required for the "WindowsKernelModeDriver10.0" MSBuild
+      # platform toolset. Without it, MSBuild cannot compile kernel drivers.
       #
-      # Strategy (tried in order):
-      #   1. Check if already installed on the runner
-      #   2. Chocolatey (most reliable for automated installs)
-      #   3. Direct MSI download with PE validation
+      # NOTE: The runner may have SDK headers (e.g. wdm.h) but NOT the WDK
+      # MSBuild toolset. We must install the full WDK regardless.
       # ------------------------------------------------------------------
       - name: Install WDK
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          # Check if WDK is already installed
-          $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
-          if (Test-Path "$wdkRoot\Include\10.0.*\km\wdm.h") {
-            Write-Host "WDK already installed at $wdkRoot"
-            Get-ChildItem "$wdkRoot\Include" -Directory | ForEach-Object { Write-Host "  SDK/WDK version: $($_.Name)" }
+          # Check if the WDK MSBuild toolset exists (not just headers)
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -property installationPath
+          $wdkTargets = Join-Path $vsPath "MSBuild\Microsoft\VC\v170\Microsoft.DriverKit.Defaults.props"
+          if (Test-Path $wdkTargets) {
+            Write-Host "WDK MSBuild toolset already installed at $wdkTargets"
             exit 0
           }
+          Write-Host "WDK MSBuild toolset NOT found (checked: $wdkTargets)"
+          Write-Host "Headers existing is NOT enough — must install full WDK."
 
-          # Try chocolatey — the most reliable method for CI
-          Write-Host "Installing WDK via Chocolatey..."
-          choco install windowsdriverkit -y --no-progress --limit-output --timeout 600
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "WDK installed successfully via Chocolatey."
-            exit 0
-          }
-          Write-Host "Chocolatey failed (exit code $LASTEXITCODE), trying direct download..."
-
-          # Fallback: direct download from Microsoft
-          $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2291857"
-          $wdkExe = "$env:TEMP\wdksetup.exe"
-
-          Write-Host "Downloading from $wdkUrl ..."
-          Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkExe -UseBasicParsing `
-            -MaximumRedirection 10 -TimeoutSec 300
-
-          # Validate the download — must start with MZ (PE executable)
-          $bytes = [System.IO.File]::ReadAllBytes($wdkExe)
-          $size = $bytes.Length
-          Write-Host "Downloaded $size bytes"
-          if ($size -lt 1000000) {
-            Write-Error "Downloaded file is too small ($size bytes) — likely a redirect/error page, not the WDK installer"
-            Write-Host "First 500 bytes (hex): $([BitConverter]::ToString($bytes[0..499]))"
+          # Install WDK via Chocolatey
+          Write-Host "Installing WDK via Chocolatey (this takes a few minutes)..."
+          choco install windowsdriverkit -y --no-progress --limit-output --timeout 900
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Chocolatey WDK install failed with exit code $LASTEXITCODE"
             exit 1
           }
-          # Check MZ signature
-          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
-            Write-Error "Downloaded file is not a PE executable — bad magic bytes"
-            exit 1
-          }
-
-          Write-Host "Running WDK installer..."
-          $proc = Start-Process -FilePath $wdkExe `
-            -ArgumentList "/quiet","/norestart" `
-            -Wait -PassThru -NoNewWindow
-          if ($proc.ExitCode -ne 0) {
-            Write-Error "WDK installer failed with exit code $($proc.ExitCode)"
-            exit 1
-          }
-          Write-Host "WDK installed successfully via direct download."
+          Write-Host "WDK installed successfully."
 
       # ------------------------------------------------------------------
-      # Step 4: Build the complete solution
-      #
-      # WinCache.sln builds both:
-      #   - cacheflt.sys  (kernel driver)
-      #   - cachectl.exe  (management tool)
+      # Step 4: Build the kernel driver (cacheflt.sys)
       # ------------------------------------------------------------------
-      - name: Build solution
+      - name: Build driver (cacheflt.sys)
         run: |
-          msbuild WinCache.sln `
+          msbuild driver\cacheflt.vcxproj `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            /p:WindowsTargetPlatformVersion=10.0 `
             /m `
             /v:minimal
 
       # ------------------------------------------------------------------
-      # Step 5: Verify outputs exist
+      # Step 5: Build the management tool (cachectl.exe)
+      #
+      # We use cl.exe directly to avoid MSBuild toolset version issues.
+      # The VS install path and VC tools are located via vswhere.
+      # ------------------------------------------------------------------
+      - name: Build manager (cachectl.exe)
+        shell: pwsh
+        run: |
+          # Find Visual Studio
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -property installationPath
+          Write-Host "Visual Studio: $vsPath"
+
+          # Find the VC tools version
+          $vcToolsVersion = Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory `
+            | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Name
+          Write-Host "VC Tools version: $vcToolsVersion"
+
+          # Set up PATH for cl.exe and friends
+          $vcBin = "$vsPath\VC\Tools\MSVC\$vcToolsVersion\bin\Hostx64\x64"
+
+          # Find the latest Windows SDK version
+          $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $sdkVer = Get-ChildItem "$sdkRoot\Include" -Directory `
+            | Where-Object { $_.Name -match '^10\.0\.\d+\.\d+$' } `
+            | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Name
+          Write-Host "Windows SDK version: $sdkVer"
+
+          $sdkBin = "$sdkRoot\bin\$sdkVer\x64"
+          $sdkInclude = "$sdkRoot\Include\$sdkVer"
+          $sdkLib = "$sdkRoot\Lib\$sdkVer"
+          $ucrtInclude = "$sdkInclude\ucrt"
+          $ucrtLib = "$sdkLib\ucrt\x64"
+
+          $vcBase = "$vsPath\VC\Tools\MSVC\$vcToolsVersion"
+          $env:PATH = "$vcBin;$sdkBin;$env:PATH"
+          $env:INCLUDE = "$vcBase\include;$sdkInclude;$ucrtInclude"
+          $env:LIB = "$vcBase\lib\x64;$sdkLib;$ucrtLib"
+
+          Write-Host "Compiler: $(Get-Command cl.exe | Select -ExpandProperty Source)"
+
+          # Build
+          New-Item -ItemType Directory -Force -Path bin\x64\Release | Out-Null
+          cl /nologo /O2 /I shared /DUNICODE /D_UNICODE /Fe:bin\x64\Release\cachectl.exe manager\main.c /link kernel32.lib advapi32.lib user32.lib
+          if ($LASTEXITCODE -ne 0) { Write-Error "cl.exe failed"; exit 1 }
+          Write-Host "cachectl.exe built successfully."
+
+      # ------------------------------------------------------------------
+      # Step 6: Verify build outputs
       # ------------------------------------------------------------------
       - name: Verify build outputs
         shell: pwsh
@@ -136,7 +145,7 @@ jobs:
           Write-Host "================================================"
 
       # ------------------------------------------------------------------
-      # Step 6: Upload artifacts (available from Actions summary page)
+      # Step 7: Upload artifacts (available from Actions summary page)
       #
       # GitHub retains artifacts for 90 days by default.
       # Download from: Actions → <this run> → Artifacts section
@@ -147,7 +156,6 @@ jobs:
           name: cacheflt-driver
           path: |
             **/cacheflt.sys
-            **/cacheflt.pdb
             driver/cacheflt.inf
 
       - name: Upload cachectl.exe
@@ -156,7 +164,6 @@ jobs:
           name: cachectl-manager
           path: |
             **/cachectl.exe
-            **/cachectl.pdb
 
       - name: Upload installer scripts
         uses: actions/upload-artifact@v4
